@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: properiptv-review-panel
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DEMO_USER
+        value: demo
+      - key: DEMO_PASS
+        value: demo
