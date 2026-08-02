@@ -20,9 +20,9 @@ Data comes from iptv-org (https://iptv-org.github.io/api/), fetched once at
 boot and held in memory.
 """
 
-import base64
 import json
 import os
+import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -108,8 +108,23 @@ def build():
     return cats, live
 
 
-LIVE_CATS, LIVE = build()
-BY_ID = {c["stream_id"]: c for c in LIVE}
+LIVE_CATS, LIVE, BY_ID = [], [], {}
+READY = threading.Event()
+
+
+def load_in_background():
+    global LIVE_CATS, LIVE, BY_ID
+    for attempt in range(3):
+        try:
+            cats, live = build()
+            LIVE_CATS, LIVE = cats, live
+            BY_ID = {c["stream_id"]: c for c in live}
+            READY.set()
+            return
+        except Exception as exc:                     # noqa: BLE001
+            print(f"catalogue load failed ({exc}); retry {attempt + 1}/3", flush=True)
+            time.sleep(5)
+    print("catalogue could not be loaded", flush=True)
 
 ACCOUNT = {
     "user_info": {
@@ -142,7 +157,7 @@ class Handler(BaseHTTPRequestHandler):
         parts = [p for p in u.path.split("/") if p]
 
         if u.path in ("/", "/health"):
-            return self._json({"ok": True, "channels": len(LIVE),
+            return self._json({"ok": True, "ready": READY.is_set(), "channels": len(LIVE),
                                "sign_in": {"server": "this URL",
                                            "username": USERNAME, "password": PASSWORD}})
 
@@ -169,8 +184,10 @@ class Handler(BaseHTTPRequestHandler):
         if action == "":
             return self._json(ACCOUNT)
         if action == "get_live_categories":
+            READY.wait(timeout=25)
             return self._json(LIVE_CATS)
         if action == "get_live_streams":
+            READY.wait(timeout=25)
             cid = q.get("category_id", [None])[0]
             rows = [c for c in LIVE if not cid or c["category_id"] == cid]
             return self._json([{k: v for k, v in c.items() if not k.startswith("_")} for c in rows])
@@ -182,5 +199,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"Xtream review panel on :{PORT}  ({USERNAME}/{PASSWORD})", flush=True)
+    threading.Thread(target=load_in_background, daemon=True).start()
+    print(f"Xtream review panel listening on :{PORT}  ({USERNAME}/{PASSWORD})", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

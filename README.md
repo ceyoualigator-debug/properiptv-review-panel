@@ -18,8 +18,14 @@ These channels are already public and the credentials protect nothing.
 ## Deploy it
 
 Anything that runs a container. On Render: New → Web Service → point at this
-repo → it reads `render.yaml`. The free plan sleeps when idle and takes ~30s to
-wake, which is fine for review.
+repo → it reads `render.yaml`.
+
+The port is bound before the catalogue is fetched, deliberately. Pulling
+several megabytes from iptv-org takes about a minute, and a free-tier host
+routes traffic the moment it wakes the container — anything not yet listening
+comes back as a 404 from the edge, which the app reports as "that address
+answered, but it isn't an IPTV portal". Sign-in therefore works immediately and
+the channel list fills in shortly after.
 
 ## Sign-in
 
