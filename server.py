@@ -24,7 +24,9 @@ import json
 import os
 import threading
 import time
+import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -40,6 +42,8 @@ UA = "Mozilla/5.0 (compatible; ProperIpTv-ReviewPanel/1.0)"
 KEEP = {"news", "business", "sports", "music", "documentary", "science",
         "travel", "weather", "culture", "education", "entertainment",
         "movies", "kids", "comedy", "lifestyle"}
+
+MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "1400"))
 
 
 def fetch(path):
@@ -60,8 +64,11 @@ def build():
         cid = s.get("channel")
         if not cid or cid not in channels or cid in best:
             continue
-        if not (s.get("url") or "").startswith("http"):
-            continue
+        url = s.get("url") or ""
+        if not url.startswith("https://"):
+            continue          # plain HTTP is blocked by ATS on a redirect target
+        if s.get("referrer") or s.get("user_agent"):
+            continue          # headers cannot be carried through a redirect
         best[cid] = s
 
     cats, cat_ids, live = [], {}, []
@@ -103,9 +110,45 @@ def build():
             "_ua": s.get("user_agent") or "",
         })
 
-    print(f"ready: {len(live)} channels in {len(cats)} categories "
+    # A reviewer needs a few working channels, not every channel on the
+    # internet. Capping the candidates keeps the verification pass short
+    # enough that a cold start is not a two-minute wait.
+    live = verify(live[:MAX_CANDIDATES])
+    kept = {c["category_id"] for c in live}
+    cats = [c for c in cats if c["category_id"] in kept]
+    print(f"ready: {len(live)} verified channels in {len(cats)} categories "
           f"across {len({c['category_name'].split(' | ')[0] for c in cats})} countries", flush=True)
     return cats, live
+
+
+def probe(row):
+    """True when the origin actually serves this stream to an anonymous client."""
+    req = urllib.request.Request(row["_url"], headers={"User-Agent": "VLC/3.0.20 LibVLC/3.0.20"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            if r.status != 200:
+                return False
+            head = r.read(1024)
+            # An HLS playlist, or at least not an HTML error page.
+            return b"#EXTM3U" in head or not head.lstrip()[:1] == b"<"
+    except Exception:                                # noqa: BLE001
+        return False
+
+
+def verify(rows):
+    """Keep only channels that respond right now.
+
+    A reviewer opens two or three channels and judges the app on them. Roughly
+    a third of any community-maintained list is dead at any moment, so serving
+    the raw list means a real chance the first thing they tap fails and the app
+    gets marked "not functional".
+    """
+    print(f"verifying {len(rows)} candidate streams…", flush=True)
+    with ThreadPoolExecutor(max_workers=128) as pool:
+        alive = list(pool.map(probe, rows))
+    kept = [r for r, ok in zip(rows, alive) if ok]
+    print(f"  {len(kept)} of {len(rows)} responded", flush=True)
+    return kept
 
 
 LIVE_CATS, LIVE, BY_ID = [], [], {}
@@ -184,10 +227,10 @@ class Handler(BaseHTTPRequestHandler):
         if action == "":
             return self._json(ACCOUNT)
         if action == "get_live_categories":
-            READY.wait(timeout=25)
+            READY.wait(timeout=75)
             return self._json(LIVE_CATS)
         if action == "get_live_streams":
-            READY.wait(timeout=25)
+            READY.wait(timeout=75)
             cid = q.get("category_id", [None])[0]
             rows = [c for c in LIVE if not cid or c["category_id"] == cid]
             return self._json([{k: v for k, v in c.items() if not k.startswith("_")} for c in rows])
