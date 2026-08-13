@@ -192,6 +192,23 @@ def load_in_background():
         except Exception as exc:                     # noqa: BLE001
             print(f"snapshot unreadable ({exc}); falling back to a live build", flush=True)
 
+    # With a snapshot loaded, refreshing on boot does more harm than good here.
+    #
+    # `verify()` runs 128 probe threads. That is fine on a laptop and ruinous on
+    # a free instance with a tenth of a CPU: the probes starve the HTTP handler,
+    # and measured against the deployed panel every catalogue request took ~45
+    # seconds for as long as the refresh ran — with /health answering instantly
+    # and reporting ready:true the whole time, which is what made it look like a
+    # cold start rather than CPU starvation.
+    #
+    # The snapshot is committed and regenerated deliberately by
+    # `make-catalogue.py`, so the refresh is a convenience, not a requirement.
+    # Set REFRESH_ON_BOOT=1 to restore it.
+    if READY.is_set() and os.environ.get("REFRESH_ON_BOOT", "") != "1":
+        print("serving the snapshot; boot refresh disabled "
+              "(REFRESH_ON_BOOT=1 to enable)", flush=True)
+        return
+
     for attempt in range(3):
         try:
             cats, live = build()
