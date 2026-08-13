@@ -1,29 +1,47 @@
 name: Keep the review panel warm
 
-# Render's free tier puts a service to sleep after 15 minutes of no traffic, and
-# a cold start takes about a minute — longer than the app's 15-second sign-in
-# timeout. An App Review session that lands on a sleeping instance therefore
-# sees "Couldn't reach the server" on the first attempt, which reads as a broken
-# app rather than as a sleeping demo server.
+# Render's free tier suspends a service after 15 minutes without traffic, and
+# waking the container takes about 45 seconds — measured, repeatedly, against
+# the live instance. An App Review session that lands on a sleeping instance
+# waits that out on its first request, which is what got the macOS build
+# rejected with "the app loaded indefinitely upon login".
 #
-# A ping every ten minutes keeps it awake. GitHub delays scheduled runs under
-# load, so the interval is deliberately well inside the fifteen-minute window.
+# This used to be `*/10 * * * *` and one curl, on the assumption that the
+# schedule would be honoured. It is not. GitHub throttles scheduled workflows
+# hard on free plans: the eight runs before this change landed 46, 54, 67, 68,
+# 76, 83 and 101 minutes apart. Every one of those gaps is wider than Render's
+# fifteen-minute window, so the instance was asleep for most of every hour and
+# the ping was keeping nothing warm.
+#
+# So the run no longer depends on being started on time — it pings for fifty
+# minutes on a five-minute interval and is scheduled hourly. Overlapping runs
+# are harmless and welcome; a late start just shifts the window.
+#
+# This is a workaround for a free tier, not a fix. A paid instance, or a host
+# that does not sleep, removes the problem outright — see README.
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '0 * * * *'
   workflow_dispatch:
+
+# Do not cancel a run in progress when the next one starts: overlap is the
+# point.
+concurrency:
+  group: keep-warm
+  cancel-in-progress: false
 
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 55
     steps:
-      - name: Wake the panel
+      - name: Ping every five minutes for fifty minutes
         run: |
-          # --max-time covers a cold start; the point of this request is to pay
-          # that cost here rather than have a reviewer pay it.
-          code=$(curl -s -o /tmp/health.json -w '%{http_code}' --max-time 180 \
-            https://properiptv-review-panel.onrender.com/health)
-          echo "HTTP $code"
-          cat /tmp/health.json; echo
-          test "$code" = "200"
+          URL="https://properiptv-review-panel.onrender.com/health"
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 90 "$URL" || echo 000)
+            secs=$(curl -s -o /dev/null -w '%{time_starttransfer}' --max-time 90 "$URL" || echo -)
+            echo "$(date -u +%H:%M:%S) ping $i/10 http=$code ttfb=${secs}s"
+            [ "$i" -lt 10 ] && sleep 300
+          done
