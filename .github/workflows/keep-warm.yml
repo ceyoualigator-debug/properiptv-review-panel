@@ -1,21 +1,25 @@
 name: Keep the review panel warm
 
 # Render's free tier suspends a service after 15 minutes without traffic, and
-# waking the container takes about 45 seconds — measured, repeatedly, against
-# the live instance. An App Review session that lands on a sleeping instance
-# waits that out on its first request, which is what got the macOS build
-# rejected with "the app loaded indefinitely upon login".
+# waking the container costs tens of seconds. An App Review session that lands
+# on a sleeping instance waits that out on its first request, which is what got
+# the macOS build rejected with "the app loaded indefinitely upon login".
 #
 # This used to be `*/10 * * * *` and one curl, on the assumption that the
 # schedule would be honoured. It is not. GitHub throttles scheduled workflows
-# hard on free plans: the eight runs before this change landed 46, 54, 67, 68,
+# hard on free plans: the eight runs before that change landed 46, 54, 67, 68,
 # 76, 83 and 101 minutes apart. Every one of those gaps is wider than Render's
 # fifteen-minute window, so the instance was asleep for most of every hour and
 # the ping was keeping nothing warm.
 #
-# So the run no longer depends on being started on time — it pings for fifty
-# minutes on a five-minute interval and is scheduled hourly. Overlapping runs
-# are harmless and welcome; a late start just shifts the window.
+# So the run no longer depends on being started on time — it pings on a
+# five-minute interval for most of an hour and is scheduled hourly. Overlapping
+# runs are harmless and welcome; a late start just shifts the window.
+#
+# PINGS was 10, which covers 45 minutes and leaves a 15-minute hole at the end
+# of every hour — exactly Render's suspend threshold, so the instance could and
+# did drop out right before the next run. 12 pings covers 55 minutes and the
+# next run overlaps the remainder.
 #
 # This is a workaround for a free tier, not a fix. A paid instance, or a host
 # that does not sleep, removes the problem outright — see README.
@@ -34,14 +38,26 @@ concurrency:
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 65
     steps:
-      - name: Ping every five minutes for fifty minutes
+      - name: Ping every five minutes for fifty-five minutes
         run: |
           URL="https://properiptv-review-panel.onrender.com/health"
-          for i in $(seq 1 10); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 90 "$URL" || echo 000)
-            secs=$(curl -s -o /dev/null -w '%{time_starttransfer}' --max-time 90 "$URL" || echo -)
-            echo "$(date -u +%H:%M:%S) ping $i/10 http=$code ttfb=${secs}s"
-            [ "$i" -lt 10 ] && sleep 300
+          PINGS=12
+          failures=0
+          for i in $(seq 1 $PINGS); do
+            read -r code secs <<<"$(curl -s -o /dev/null \
+              -w '%{http_code} %{time_starttransfer}' --max-time 90 "$URL" || echo '000 -')"
+            echo "$(date -u +%H:%M:%S) ping $i/$PINGS http=$code ttfb=${secs}s"
+            [ "$code" = "200" ] || failures=$((failures + 1))
+            # Guarded with `if`, not `[ ... ] && sleep`: the && form leaves the
+            # loop's last command with exit status 1 on the final iteration,
+            # which becomes the step's status. Every run of this workflow was
+            # reported as a failure for that reason alone, while every ping
+            # inside it returned 200 — so a genuine outage would have looked
+            # exactly like the noise and gone unnoticed.
+            if [ "$i" -lt "$PINGS" ]; then sleep 300; fi
           done
+          echo "$failures of $PINGS pings did not return 200"
+          # Fail only when the panel is actually unhealthy for most of the hour.
+          [ "$failures" -le 3 ]
