@@ -20,6 +20,7 @@ Data comes from iptv-org (https://iptv-org.github.io/api/), fetched once at
 boot and held in memory.
 """
 
+import base64
 import json
 import os
 import pathlib
@@ -221,6 +222,104 @@ def load_in_background():
     if not READY.is_set():
         print("catalogue could not be loaded", flush=True)
 
+# --- Guide -------------------------------------------------------------------
+#
+# **App Review could not reach the calendar feature without this.**
+#
+# The panel answered `get_short_epg` with an empty list and `get_simple_data_table`
+# with `[]`, so every one of the 1,059 channels rendered as "No guide data". With
+# no programme rows there is nothing to pin, My Calendar stays empty, and "Add to
+# Calendar" — the one control that exercises
+# `com.apple.security.personal-information.calendars` — is unreachable. The macOS
+# rejection under 2.4.5 asked us to demonstrate exactly that entitlement, and the
+# demo account we supplied made it impossible to demonstrate.
+#
+# The schedule is synthesised rather than fetched. iptv-org publishes guide data
+# only as XMLTV behind third-party URLs: tens of megabytes, frequently stale or
+# offline, and fetching it at start-up would reintroduce precisely the cold-start
+# that got the build rejected under 2.1(a). This costs nothing at boot and is
+# generated per request from the stream id, so it is stable across calls — a
+# programme does not rename itself between the guide and the calendar event.
+#
+# Titles follow the channel's own genre so the guide reads plausibly. The
+# reviewer notes say the schedule is sample data; it is a review fixture, not a
+# claim about what is really on air.
+
+SLOT_MINUTES = 60
+
+GENRE_SLOTS = {
+    "news":          ["World News", "Headlines", "The Briefing", "News Hour", "Newsroom Live"],
+    "business":      ["Market Open", "Business Today", "The Ledger", "Closing Bell"],
+    "sports":        ["Live Sport", "Match of the Day", "Sports Desk", "Full Time"],
+    "music":         ["The Playlist", "Live Sessions", "Chart Show", "Late Night Music"],
+    "documentary":   ["Living Planet", "The Deep Field", "Frontier", "Witness"],
+    "science":       ["Horizons", "The Method", "Cosmos Explained", "Lab Notes"],
+    "travel":        ["Far Places", "The Slow Road", "City Guide", "Wayfarer"],
+    "weather":       ["Weather Watch", "The Forecast", "Storm Track"],
+    "culture":       ["Gallery", "Stage Door", "The Long Read", "Arts Review"],
+    "education":     ["Classroom", "First Principles", "The Lecture", "Study Hall"],
+    "entertainment": ["The Late Show", "Prime Time", "Talk of the Town", "Encore"],
+    "movies":        ["Feature Presentation", "Matinee", "Cinema Classics", "Double Bill"],
+    "kids":          ["Morning Cartoons", "Storytime", "Playroom", "Adventure Club"],
+    "comedy":        ["Stand-Up Hour", "The Sketch Show", "Comedy Club", "Punchline"],
+    "lifestyle":     ["The Kitchen", "Home & Garden", "Weekend Living", "Made by Hand"],
+}
+DEFAULT_SLOTS = ["Programming", "Continuous Coverage", "On Air"]
+
+
+def _b64(text):
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def _genre_for(row):
+    """The genre half of a "SE | NEWS" category label."""
+    for c in LIVE_CATS:
+        if c["category_id"] == row.get("category_id"):
+            parts = c["category_name"].split(" | ")
+            if len(parts) == 2:
+                return parts[1].lower()
+    return ""
+
+
+def epg_listings(row, start, count):
+    """`count` consecutive slots from the slot containing `start`.
+
+    Both guide endpoints share this shape: `get_simple_data_table` is the same
+    JSON as `get_short_epg` with more rows, which is what the app already
+    expects (see `XtreamClient.fullEPG`).
+    """
+    titles = GENRE_SLOTS.get(_genre_for(row), DEFAULT_SLOTS)
+    step = SLOT_MINUTES * 60
+    first = (int(start) // step) * step
+    now = int(time.time())
+    sid = int(row["stream_id"])
+    name = row["name"].split(" | ", 1)[-1]
+
+    out = []
+    for i in range(count):
+        begin = first + i * step
+        end = begin + step
+        # Deterministic in the stream id and the absolute slot, so the same
+        # programme keeps the same name on every request.
+        title = titles[(sid + begin // step) % len(titles)]
+        out.append({
+            "id": str(sid * 100000 + (begin // step) % 100000),
+            "epg_id": str(sid),
+            "title": _b64(title),
+            "lang": "",
+            "start": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(begin)),
+            "end": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(end)),
+            "description": _b64(f"{title} on {name}. Sample schedule supplied by the "
+                                f"ProperIpTv review server."),
+            "channel_id": row.get("epg_channel_id") or str(sid),
+            "start_timestamp": str(begin),
+            "stop_timestamp": str(end),
+            "now_playing": 1 if begin <= now < end else 0,
+            "has_archive": 0,
+        })
+    return {"epg_listings": out}
+
+
 ACCOUNT = {
     "user_info": {
         "username": USERNAME, "password": PASSWORD, "auth": 1, "status": "Active",
@@ -286,8 +385,25 @@ class Handler(BaseHTTPRequestHandler):
             cid = q.get("category_id", [None])[0]
             rows = [c for c in LIVE if not cid or c["category_id"] == cid]
             return self._json([{k: v for k, v in c.items() if not k.startswith("_")} for c in rows])
-        if action == "get_short_epg":
-            return self._json({"epg_listings": []})
+        if action in ("get_short_epg", "get_simple_data_table"):
+            try:
+                sid = int(q.get("stream_id", ["0"])[0])
+            except ValueError:
+                sid = 0
+            row = BY_ID.get(sid)
+            if not row:
+                return self._json({"epg_listings": []})
+            if action == "get_short_epg":
+                # What is on now and next. The app asks for `limit`.
+                try:
+                    limit = max(1, min(48, int(q.get("limit", ["12"])[0])))
+                except ValueError:
+                    limit = 12
+                return self._json(epg_listings(row, time.time(), limit))
+            # The full published schedule: yesterday evening through tomorrow,
+            # so there are always future programmes available to pin.
+            start = time.time() - 12 * 3600
+            return self._json(epg_listings(row, start, 48))
         # No VOD here: these are live streams only, and an empty list is how a
         # panel without a movie package answers.
         return self._json([])
